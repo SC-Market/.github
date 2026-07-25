@@ -1,0 +1,200 @@
+name: Deploy to Lightsail (reusable)
+
+# Reusable workflow: build a Docker image, push it to GHCR, then redeploy a
+# Lightsail container service to the freshly built SHA and prune old images.
+# Authenticates to AWS with a per-repo OIDC role. Call it like:
+#
+#   jobs:
+#     deploy:
+#       uses: SC-Market/.github/.github/workflows/deploy-lightsail.yml@main
+#       with:
+#         service-name: sc-market
+#         container-name: backend
+#         role-arn: arn:aws:iam::272095582125:role/github-actions-lightsail-deploy
+#
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Lightsail container service name"
+        required: true
+        type: string
+      container-name:
+        description: "Container within the service to update"
+        required: true
+        type: string
+      role-arn:
+        description: "IAM role ARN to assume via OIDC (not a secret)"
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region"
+        required: false
+        default: "us-east-2"
+        type: string
+      node-version:
+        description: "Node version for the pre-build test step"
+        required: false
+        default: "24"
+        type: string
+      run-tests:
+        description: "Run `npm ci && npm test` before building the image"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ inputs.run-tests }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        if: ${{ inputs.run-tests }}
+        run: npm ci
+
+      - name: Run tests
+        if: ${{ inputs.run-tests }}
+        run: npm test
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=main
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Force Lightsail redeployment
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+          CONTAINER_NAME: ${{ inputs.container-name }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          # Wait for any in-progress deployment to finish
+          echo "Checking for in-progress deployments..."
+          while true; do
+            STATE=$(aws lightsail get-container-services \
+              --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+              --query 'containerServices[0].state' --output text)
+            if [ "$STATE" = "READY" ] || [ "$STATE" = "RUNNING" ]; then
+              echo "Service is $STATE, ready for new deployment"; break
+            elif [ "$STATE" = "DEPLOYING" ] || [ "$STATE" = "UPDATING" ]; then
+              echo "Service is $STATE, waiting 30s..."; sleep 30
+            else
+              echo "Service state: $STATE"; break
+            fi
+          done
+
+          IMAGE_TAG_SHORT="${GITHUB_SHA:0:7}"
+
+          CURRENT_DEPLOYMENT=$(aws lightsail get-container-services \
+            --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+            --query 'containerServices[0].currentDeployment' --output json)
+
+          # Update only the target container's image to the new SHA tag
+          CONTAINERS=$(echo "$CURRENT_DEPLOYMENT" | jq \
+            --arg c "$CONTAINER_NAME" \
+            --arg img "$IMAGE_REPO:$IMAGE_TAG_SHORT" \
+            '.containers | .[$c].image = $img')
+
+          PUBLIC_ENDPOINT=$(echo "$CURRENT_DEPLOYMENT" | jq '.publicEndpoint')
+
+          echo "Deploying $CONTAINER_NAME -> $IMAGE_REPO:$IMAGE_TAG_SHORT"
+          aws lightsail create-container-service-deployment \
+            --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+            --containers "$CONTAINERS" \
+            --public-endpoint "$PUBLIC_ENDPOINT" > /dev/null
+
+          echo "Waiting for deployment to complete..."
+          TIMEOUT=600; ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATE=$(aws lightsail get-container-services \
+              --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+              --query 'containerServices[0].state' --output text)
+            if [ "$STATE" = "RUNNING" ]; then
+              echo "✓ Deployment completed - Service is RUNNING"; exit 0
+            elif [ "$STATE" = "READY" ]; then
+              echo "✓ Service is READY (no active deployment)"; exit 0
+            elif [ "$STATE" = "DEPLOYING" ] || [ "$STATE" = "UPDATING" ]; then
+              echo "Deployment in progress... ($ELAPSED/$TIMEOUT s) - $STATE"
+              sleep 30; ELAPSED=$((ELAPSED + 30))
+            else
+              echo "✗ Deployment failed with state: $STATE"; exit 1
+            fi
+          done
+          echo "✗ Deployment timed out after $TIMEOUT seconds"; exit 1
+
+      - name: Clean up old Lightsail container images
+        if: success()
+        env:
+          SERVICE_NAME: ${{ inputs.service-name }}
+          CONTAINER_NAME: ${{ inputs.container-name }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          CURRENT_IMAGE=$(aws lightsail get-container-services \
+            --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+            --query "containerServices[0].currentDeployment.containers.$CONTAINER_NAME.image" \
+            --output text)
+          echo "Current deployment image: $CURRENT_IMAGE"
+
+          ALL_IMAGES=$(aws lightsail get-container-images \
+            --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+            --query 'containerImages[].image' --output text)
+
+          DELETED=0
+          for IMG in $ALL_IMAGES; do
+            if [ "$IMG" = "$CURRENT_IMAGE" ]; then
+              echo "Skipping (active): $IMG"; continue
+            fi
+            echo "Deleting: $IMG"
+            if aws lightsail delete-container-image \
+              --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+              --image "$IMG" 2>&1; then
+              DELETED=$((DELETED + 1))
+            else
+              echo "Warning: could not delete $IMG (may still be referenced)"
+            fi
+          done
+          echo "Image cleanup complete — deleted $DELETED image(s)"

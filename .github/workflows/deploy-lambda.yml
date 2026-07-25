@@ -1,0 +1,80 @@
+name: Deploy Lambda (reusable)
+
+# Reusable workflow: build a Node Lambda (with native Linux Sharp binaries when
+# present) and publish new code via update-function-code, authenticating with a
+# per-repo OIDC role. Call it from a repo like:
+#
+#   jobs:
+#     deploy:
+#       uses: SC-Market/.github/.github/workflows/deploy-lambda.yml@main
+#       with:
+#         function-name: sc-market-image-lambda
+#         role-arn: arn:aws:iam::272095582125:role/github-actions-image-lambda-deploy
+#
+on:
+  workflow_call:
+    inputs:
+      function-name:
+        description: "Lambda function name to update"
+        required: true
+        type: string
+      role-arn:
+        description: "IAM role ARN to assume via OIDC (not a secret)"
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region"
+        required: false
+        default: "us-east-2"
+        type: string
+      node-version:
+        description: "Node version (match the Lambda runtime)"
+        required: false
+        default: "22"
+        type: string
+      package-command:
+        description: "npm script that builds dist/lambda.zip"
+        required: false
+        default: "package"
+        type: string
+      zip-path:
+        description: "Path to the built deployment zip"
+        required: false
+        default: "dist/lambda.zip"
+        type: string
+
+permissions:
+  id-token: write # required for AWS OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and package
+        run: npm run ${{ inputs.package-command }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Deploy to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ inputs.function-name }}" \
+            --zip-file "fileb://${{ inputs.zip-path }}" \
+            --publish

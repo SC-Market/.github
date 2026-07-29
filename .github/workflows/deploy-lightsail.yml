@@ -129,6 +129,12 @@ jobs:
 
           IMAGE_TAG_SHORT="${GITHUB_SHA:0:7}"
 
+          # GHCR repo paths are lowercase, but github.repository preserves the
+          # org's casing (SC-Market/...). docker/metadata-action lowercases the
+          # tags it generates; this step builds the reference by hand, so it has
+          # to lowercase too or Lightsail gets an image it cannot pull.
+          IMAGE_REPO="$(echo "$IMAGE_REPO" | tr '[:upper:]' '[:lower:]')"
+
           CURRENT_DEPLOYMENT=$(aws lightsail get-container-services \
             --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
             --query 'containerServices[0].currentDeployment' --output json)

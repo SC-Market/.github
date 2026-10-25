@@ -73,8 +73,15 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
 
       - name: Deploy to Lambda
+        env:
+          FUNCTION_NAME: ${{ inputs.function-name }}
+          ZIP_PATH: ${{ inputs.zip-path }}
+        # Print only the published version: the full response includes
+        # Environment.Variables (secrets), which GitHub doesn't mask here
+        # because this job never references them.
         run: |
           aws lambda update-function-code \
-            --function-name "${{ inputs.function-name }}" \
-            --zip-file "fileb://${{ inputs.zip-path }}" \
-            --publish
+            --function-name "$FUNCTION_NAME" \
+            --zip-file "fileb://$ZIP_PATH" \
+            --publish \
+            --query Version --output text

@@ -153,24 +153,62 @@ jobs:
             --containers "$CONTAINERS" \
             --public-endpoint "$PUBLIC_ENDPOINT" > /dev/null
 
+          EXPECTED_IMAGE="$IMAGE_REPO:$IMAGE_TAG_SHORT"
+
+          # Only the image of the target container, never the environment.
+          current_image() {
+            aws lightsail get-container-services \
+              --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+              --query "containerServices[0].currentDeployment.containers.\"$CONTAINER_NAME\".image" \
+              --output text
+          }
+
+          # The state alone isn't enough: when the new containers fail their
+          # health checks Lightsail rolls back to the previous deployment and
+          # goes back to RUNNING. The deploy only counts once the current
+          # deployment runs the image we just pushed.
           echo "Waiting for deployment to complete..."
-          TIMEOUT=600; ELAPSED=0
+          TIMEOUT=900; ELAPSED=0; SETTLED_CHECKS=0
           while [ $ELAPSED -lt $TIMEOUT ]; do
             STATE=$(aws lightsail get-container-services \
               --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
               --query 'containerServices[0].state' --output text)
-            if [ "$STATE" = "RUNNING" ]; then
-              echo "✓ Deployment completed - Service is RUNNING"; exit 0
-            elif [ "$STATE" = "READY" ]; then
-              echo "✓ Service is READY (no active deployment)"; exit 0
+            if [ "$STATE" = "RUNNING" ] || [ "$STATE" = "READY" ]; then
+              CURRENT_IMAGE=$(current_image)
+              if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
+                echo "✓ Deployment completed - $CONTAINER_NAME runs $CURRENT_IMAGE (service $STATE)"; exit 0
+              fi
+              # A pending deployment means it hasn't switched over yet.
+              NEXT_STATE=$(aws lightsail get-container-services \
+                --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+                --query 'containerServices[0].nextDeployment.state' --output text)
+              if [ "$NEXT_STATE" != "None" ] && [ -n "$NEXT_STATE" ]; then
+                SETTLED_CHECKS=0
+                echo "Next deployment is $NEXT_STATE... ($ELAPSED/$TIMEOUT s)"
+                sleep 20; ELAPSED=$((ELAPSED + 20)); continue
+              fi
+              # No pending deployment and still the old image: give it a
+              # moment, then call it a rollback.
+              SETTLED_CHECKS=$((SETTLED_CHECKS + 1))
+              if [ $SETTLED_CHECKS -ge 3 ]; then
+                echo "✗ Deployment did not go live: service is $STATE but $CONTAINER_NAME runs $CURRENT_IMAGE, expected $EXPECTED_IMAGE (Lightsail rolled back)"
+                aws lightsail get-container-service-deployments \
+                  --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+                  --query "containerServiceDeployments[0:3].{version: version, state: state, image: containers.\"$CONTAINER_NAME\".image, createdAt: createdAt}" \
+                  --output table || true
+                exit 1
+              fi
+              echo "Service is $STATE but $CONTAINER_NAME still runs $CURRENT_IMAGE; checking again ($SETTLED_CHECKS/3)"
+              sleep 20; ELAPSED=$((ELAPSED + 20))
             elif [ "$STATE" = "DEPLOYING" ] || [ "$STATE" = "UPDATING" ]; then
+              SETTLED_CHECKS=0
               echo "Deployment in progress... ($ELAPSED/$TIMEOUT s) - $STATE"
               sleep 30; ELAPSED=$((ELAPSED + 30))
             else
               echo "✗ Deployment failed with state: $STATE"; exit 1
             fi
           done
-          echo "✗ Deployment timed out after $TIMEOUT seconds"; exit 1
+          echo "✗ Deployment timed out after $TIMEOUT seconds; $CONTAINER_NAME runs $(current_image), expected $EXPECTED_IMAGE"; exit 1
 
       - name: Clean up old Lightsail container images
         if: success()
